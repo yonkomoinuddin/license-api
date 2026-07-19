@@ -1,41 +1,213 @@
-const Database = require('better-sqlite3');
+const fs = require('fs');
 const path = require('path');
 
-const db = new Database(path.join(__dirname, 'licenses.db'));
-db.pragma('journal_mode = WAL');
+const dbPath = path.join(__dirname, 'licenses.db');
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS products (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_key TEXT UNIQUE NOT NULL,
-    name TEXT NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
+// Simple file-based JSON database (works everywhere, including Railway)
+class SimpleDB {
+  constructor() {
+    this.data = {
+      products: [],
+      licenses: [],
+      logs: []
+    };
+    this.nextProductId = 1;
+    this.nextLicenseId = 1;
+    this.nextLogId = 1;
+    this.load();
+  }
 
-CREATE TABLE IF NOT EXISTS licenses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    license_key TEXT UNIQUE NOT NULL,
-    product_id INTEGER NOT NULL,
-    customer_name TEXT,
-    status TEXT NOT NULL DEFAULT 'active',      -- 'active' | 'revoked'
-    bound_ip TEXT,                               -- auto-set on first successful validation
-    bound_cidr TEXT,                              -- optional manual override, e.g. '203.0.113.0/24'
-    last_seen_ip TEXT,
-    last_seen_at TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (product_id) REFERENCES products(id)
-);
+  load() {
+    if (fs.existsSync(dbPath)) {
+      try {
+        this.data = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+        this.nextProductId = Math.max(...this.data.products.map(p => p.id), 0) + 1;
+        this.nextLicenseId = Math.max(...this.data.licenses.map(l => l.id), 0) + 1;
+        this.nextLogId = Math.max(...this.data.logs.map(l => l.id), 0) + 1;
+      } catch (e) {
+        console.error('Error loading database:', e);
+      }
+    }
+  }
 
-CREATE TABLE IF NOT EXISTS logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    license_id INTEGER,
-    ip TEXT,
-    resource_name TEXT,
-    server_hostname TEXT,
-    valid INTEGER NOT NULL,
-    reason TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-`);
+  save() {
+    fs.writeFileSync(dbPath, JSON.stringify(this.data, null, 2));
+  }
 
-module.exports = db;
+  prepare(sql) {
+    return new PreparedStatement(sql, this);
+  }
+
+  exec(sql) {
+    // Not used in our code
+  }
+
+  pragma(pragma) {
+    // Not used in our code
+  }
+}
+
+class PreparedStatement {
+  constructor(sql, db) {
+    this.sql = sql;
+    this.db = db;
+  }
+
+  run(...params) {
+    const sql = this.sql;
+
+    // INSERT INTO products
+    if (sql.includes('INSERT INTO products')) {
+      const product = {
+        id: this.db.nextProductId++,
+        product_key: params[0],
+        name: params[1],
+        created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
+      };
+      this.db.data.products.push(product);
+      this.db.save();
+      return { lastInsertRowid: product.id };
+    }
+
+    // INSERT INTO licenses
+    if (sql.includes('INSERT INTO licenses')) {
+      const license = {
+        id: this.db.nextLicenseId++,
+        license_key: params[0],
+        product_id: params[1],
+        customer_name: params[2],
+        bound_cidr: params[3],
+        status: 'active',
+        bound_ip: null,
+        last_seen_ip: null,
+        last_seen_at: null,
+        created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
+      };
+      this.db.data.licenses.push(license);
+      this.db.save();
+      return { lastInsertRowid: license.id };
+    }
+
+    // INSERT INTO logs
+    if (sql.includes('INSERT INTO logs')) {
+      const log = {
+        id: this.db.nextLogId++,
+        license_id: params[0],
+        ip: params[1],
+        resource_name: params[2],
+        server_hostname: params[3],
+        valid: params[4],
+        reason: params[5],
+        created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
+      };
+      this.db.data.logs.push(log);
+      this.db.save();
+      return { lastInsertRowid: log.id };
+    }
+
+    // UPDATE licenses SET bound_ip
+    if (sql.includes('UPDATE licenses SET bound_ip')) {
+      const licenseId = params[1];
+      const license = this.db.data.licenses.find(l => l.id === licenseId);
+      if (license) {
+        license.bound_ip = params[0];
+        this.db.save();
+      }
+      return {};
+    }
+
+    // UPDATE licenses SET last_seen_ip
+    if (sql.includes('UPDATE licenses SET last_seen_ip')) {
+      const licenseId = params[1];
+      const license = this.db.data.licenses.find(l => l.id === licenseId);
+      if (license) {
+        license.last_seen_ip = params[0];
+        license.last_seen_at = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        this.db.save();
+      }
+      return {};
+    }
+
+    // UPDATE licenses SET status = 'revoked'
+    if (sql.includes("UPDATE licenses SET status = 'revoked'")) {
+      const licenseId = params[0];
+      const license = this.db.data.licenses.find(l => l.id === licenseId);
+      if (license) {
+        license.status = 'revoked';
+        this.db.save();
+      }
+      return {};
+    }
+
+    // UPDATE licenses SET status = 'active'
+    if (sql.includes("UPDATE licenses SET status = 'active'")) {
+      const licenseId = params[0];
+      const license = this.db.data.licenses.find(l => l.id === licenseId);
+      if (license) {
+        license.status = 'active';
+        this.db.save();
+      }
+      return {};
+    }
+
+    // UPDATE licenses SET bound_ip = NULL
+    if (sql.includes('UPDATE licenses SET bound_ip = NULL')) {
+      const licenseId = params[0];
+      const license = this.db.data.licenses.find(l => l.id === licenseId);
+      if (license) {
+        license.bound_ip = null;
+        this.db.save();
+      }
+      return {};
+    }
+
+    return {};
+  }
+
+  get(...params) {
+    const sql = this.sql;
+
+    // SELECT * FROM products WHERE product_key
+    if (sql.includes('SELECT * FROM products WHERE product_key')) {
+      return this.db.data.products.find(p => p.product_key === params[0]);
+    }
+
+    // SELECT * FROM licenses WHERE license_key
+    if (sql.includes('SELECT * FROM licenses WHERE license_key')) {
+      return this.db.data.licenses.find(l => l.license_key === params[0] && l.product_id === params[1]);
+    }
+
+    return null;
+  }
+
+  all(...params) {
+    const sql = this.sql;
+
+    // SELECT * FROM products
+    if (sql.includes('SELECT * FROM products ORDER BY created_at DESC')) {
+      return [...this.db.data.products].sort((a, b) => 
+        new Date(b.created_at) - new Date(a.created_at)
+      );
+    }
+
+    // SELECT licenses.*, products.name
+    if (sql.includes('SELECT licenses.*, products.name AS product_name')) {
+      return this.db.data.licenses.map(l => {
+        const product = this.db.data.products.find(p => p.id === l.product_id);
+        return { ...l, product_name: product?.name || 'Unknown' };
+      }).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    }
+
+    // SELECT * FROM logs WHERE license_id
+    if (sql.includes('SELECT * FROM logs WHERE license_id')) {
+      return this.db.data.logs
+        .filter(l => l.license_id === params[0])
+        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+        .slice(0, 100);
+    }
+
+    return [];
+  }
+}
+
+module.exports = new SimpleDB();
